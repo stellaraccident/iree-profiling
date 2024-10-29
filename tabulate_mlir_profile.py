@@ -10,6 +10,7 @@ from typing import BinaryIO
 import argparse
 import io
 import json
+import math
 from pathlib import Path
 import re
 from tqdm import tqdm
@@ -27,6 +28,7 @@ class EventInfo:
         "pass_name",
         "pattern_name",
         "iteration",
+        "ident",
     ]
 
     def __init__(self, ts_start: int, name: str, args: dict):
@@ -39,24 +41,33 @@ class EventInfo:
         self.pass_name = None
         self.pattern_name = None
         self.iteration = None
+        self.ident = None
         # Unfortunately, MLIR emits all useful information free form with
         # desc strings. These even have typos.
         if name == "pass-execution" and (
-            m := re.search(r"`pass-execution` running `([^`])`", desc)
+            m := re.search(r"`pass-execution` running `([^`]*)`", desc)
         ):
             self.pass_name = m.group(1)
+            self.ident = f"pass.{self.pass_name}"
         elif name == "apply-pattern" and (
             m := re.search(r"apply-pattern pattern: (.*)", desc)
         ):
             self.pattern_name = m.group(1)
+            self.ident = f"pattern.{self.pattern_name}"
         elif name == "GreedyPatternRewriteIteration" and (
             m := re.search(r"GreedyPatternRewriteIteration\(([0-9]+)\)", desc)
         ):
             self.iteration = int(m.group(1))
+            self.ident = f"GreedyPatternRewriteIteration"
+        else:
+            print(f"warning: failed to categorize event: {self}")
 
     @property
     def duration(self) -> float:
         return (self.ts_end - self.ts_start) / 1000000.0
+
+    def __repr__(self):
+        return f"EventInfo(name={self.name}, args={self.args})"
 
 
 class ThreadState:
@@ -78,7 +89,7 @@ class ThreadState:
         event.scope = scope
         self.event_stack.append(event)
         if event.pass_name is not None:
-            self.pass_stack.append(event.pass_name)
+            self.pass_stack.append(event.ident)
 
     def end(self, ts_end: int):
         event = self.event_stack.pop()
@@ -88,14 +99,167 @@ class ThreadState:
         return event
 
 
-class EventScope:
-    def __init__(self, name: str):
-        self.name = name
+class Stats:
+    __slots__ = [
+        "ident",
+        "min",
+        "max",
+        "count",
+        "sum",
+        "sum_x2",
+    ]
 
-    def record_event(self, event: EventInfo): ...
+    def __init__(self, event: EventInfo):
+        self.ident = event.ident
+        initial = event.duration
+        self.min = self.max = initial
+        self.count = 1
+        self.sum = initial
+        self.sum_x2 = initial * initial
+
+    def add(self, event: EventInfo):
+        d = event.duration
+        self.count += 1
+        self.min = min(self.min, d)
+        self.max = max(self.max, d)
+        self.sum += d
+        self.sum_x2 += d * d
+
+    @property
+    def mean(self) -> float:
+        return self.sum / self.count
+
+    @property
+    def stddev(self) -> float:
+        mean = self.mean
+        return math.sqrt((self.sum_x2 / self.count) - (mean * mean))
+
+
+class EventScope:
+    __slots__ = [
+        "db",
+        "name",
+        "stats",
+    ]
+
+    def __init__(self, db: "EventDb", name: str):
+        self.db = db
+        self.name = name
+        self.stats: dict[str, Stats] = {}  # Keyed by event.ident
+
+    def record_event(self, event: EventInfo):
+        ident = event.ident
+        if ident is None:
+            print(f"warning: dropped event {event}")
+            return
+        row = self.stats.get(ident)
+        if row is None:
+            row = Stats(event)
+            self.stats[ident] = row
+        else:
+            row.add(event)
+
+    def write_report(self, report_path: Path):
+        def w(s):
+            out.write(s)
+
+        def wl(s):
+            out.write(s)
+            out.write("\n")
+
+        def link_scope(row: Stats):
+            if row.ident in self.db.scopes:
+                return f"<a href='{row.ident}.html'>{row.ident}</a>"
+            else:
+                return row.ident
+
+        def start_stats_table():
+            wl("<table>")
+            wl("<tr>")
+            wl("<th>Name</th>")
+            wl("<th>Total</th>")
+            wl("<th>Count</th>")
+            wl("<th>MEAN</th>")
+            wl("<th>MIN</th>")
+            wl("<th>MAX</th>")
+            wl("<th>STDDEV</th>")
+            wl("</tr>")
+
+        def end_stats_table():
+            wl("</table>")
+
+        def stats_row(row: Stats):
+            sum_scale, sum_label = human_scale(row.sum)
+            mean_scale, mean_label = human_scale(row.mean)
+            wl("<tr>")
+            wl(f"<td>{link_scope(row)}</td>")
+            wl(f"<td>{row.sum * sum_scale} {sum_label}</td>")
+            wl(f"<td>{row.count}</td>")
+            wl(f"<td>{row.mean * mean_scale} {mean_label}</td>")
+            wl(f"<td>{row.min * mean_scale}</td>")
+            wl(f"<td>{row.max * mean_scale}</td>")
+            wl(f"<td>{row.stddev * mean_scale}</td>")
+            wl("</tr>")
+
+        def stats_table(rows):
+            start_stats_table()
+            for row in rows:
+                stats_row(row)
+            end_stats_table()
+
+        with open(report_path, "wt") as out:
+            wl("<html>")
+            wl(f"<head><title>Series report: {self.name}</title></head>")
+            wl(f"<style>")
+            wl(
+                "table {border-width: thin; border-spacing: 2px; border-style: none; border-color: black; border-collapse: collapse;}"
+            )
+            wl("td, th { border: 1px solid black; }")
+            wl(f"</style>")
+            wl(f"<body>")
+
+            pass_rows = [s for s in self.stats.values() if s.ident.startswith("pass.")]
+            if pass_rows:
+                wl(f"<h1>Passes in Execution Order:</h1>")
+                stats_table(pass_rows)
+
+                # Show in descending order of total cost
+                rows_desc = sorted(pass_rows, key=lambda row: row.sum, reverse=True)
+                wl(f"<h1>Passes in descending order of duration:</h1>")
+                stats_table(rows_desc)
+
+            iteration_rows = [
+                s
+                for s in self.stats.values()
+                if s.ident in ["GreedyPatternRewriteIteration"]
+            ]
+            if iteration_rows:
+                # Show in descending order of total cost
+                rows_desc = sorted(
+                    iteration_rows, key=lambda row: row.sum, reverse=True
+                )
+                wl(f"<h1>Iteration actions:</h1>")
+                stats_table(rows_desc)
+
+            pattern_rows = [
+                s for s in self.stats.values() if s.ident.startswith("pattern.")
+            ]
+            if pattern_rows:
+                # Show in descending order of total cost
+                rows_desc = sorted(pattern_rows, key=lambda row: row.sum, reverse=True)
+                wl(f"<h1>Patterns in descending order of duration:</h1>")
+                stats_table(rows_desc)
+
+            wl(f"</body>")
+            wl("</html>")
 
 
 class EventDb:
+    __slots__ = [
+        "threads",
+        "scopes",
+    ]
+
     def __init__(self):
         self.threads: dict[ThreadState] = {}
         self.scopes: dict[str, EventScope] = {}
@@ -104,14 +268,14 @@ class EventDb:
         try:
             scope = self.scopes[name]
         except KeyError:
-            scope = self.scopes[name] = EventScope(name)
+            scope = self.scopes[name] = EventScope(self, name)
         return scope
 
     def record_event(self, event: EventInfo):
         self.get_scope("__GLOBAL__").record_event(event)
         scope = event.scope
         if scope is not None:
-            self.get_scope(scope).record_event(event)
+            self.get_scope(scope if scope else "__UNNAMED__").record_event(event)
 
     def load_file(self, f: BinaryIO):
         # Because Chrome tracing files are mammoth when spewed onto this great
@@ -141,9 +305,9 @@ class EventDb:
                     print("error decoding record:", e)
                 self.handle_record(record)
 
-                # TEMP: Early exit for debugging
-                if line_number > 1000000:
-                    break
+                # DEBUGGING: Early exit for debugging
+                # if line_number > 1000000:
+                #     break
 
     def handle_record(self, record: dict):
         cat = record["cat"]
@@ -166,9 +330,16 @@ class EventDb:
         except KeyError:
             t = self.threads[tid] = ThreadState(tid)
         return t
-    
+
     def write_reports(self, dest_dir: Path):
-        ...
+        for scope in self.scopes.values():
+            if scope.name == "__GLOBAL__":
+                file_name = "index.html"
+            else:
+                file_name = f"{scope.name}.html"
+            report_path = dest_dir / file_name
+            print(f"Writing report {report_path}")
+            scope.write_report(report_path)
 
 
 def main(argv):
@@ -190,6 +361,15 @@ def main(argv):
     dest_dir: Path = args.dest
     dest_dir.mkdir(parents=True, exist_ok=True)
     db.write_reports(dest_dir)
+
+
+def human_scale(value: float) -> tuple[float, str]:
+    if value > 0.1:
+        return 1.0, "SECONDS"
+    elif value > 0.0009:
+        return 1000.0, "MILLIS"
+    else:
+        return 1000000.0, "MICROS"
 
 
 if __name__ == "__main__":
